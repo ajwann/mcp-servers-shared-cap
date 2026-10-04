@@ -3,6 +3,8 @@
 # The shared spend cap for every MCP server in one GCP project.
 #
 #     budget ──cost updates──> Pub/Sub ──> function ──> unlinks the project's billing
+#     daily schedule (in a project of its own) ──> reset function ──> links it again
+#                                                   once the month it tripped in is over
 #
 # Google Cloud has no hard spending limit; a budget only sends email. This is the
 # documented substitute, and it is deliberately NOT owned by any one server:
@@ -29,6 +31,8 @@
 #   SPEND_CAP_DRY_RUN    true: the function only logs         (default false)
 #   SHARED_CAP_BUILD_SA  build service account for the function
 #                        (default: any *-build@ account in the project)
+#   SHARED_CAP_AUTO_RESET     false: billing stays off until linked by hand (default true)
+#   SHARED_CAP_RESET_PROJECT  project that runs the monthly reset (default mcp-servers-cap-reset)
 
 set -euo pipefail
 
@@ -40,6 +44,8 @@ REGION="${SHARED_CAP_REGION:-us-east1}"
 BUDGET_USD="${SHARED_CAP_USD:-5}"
 SPEND_CAP_AT="${SPEND_CAP_AT:-1.0}"
 SPEND_CAP_DRY_RUN="${SPEND_CAP_DRY_RUN:-false}"
+AUTO_RESET="${SHARED_CAP_AUTO_RESET:-true}"
+RESET_PROJECT="${SHARED_CAP_RESET_PROJECT:-mcp-servers-cap-reset}"
 
 # Named for the account rather than any server, because it governs them all.
 readonly BUDGET_NAME="Adam Wanningers MCP Servers shared cap"
@@ -49,6 +55,16 @@ readonly SPEND_SA_ID="mcp-shared-spendcap"
 # Google's own identity for publishing budget notifications.
 readonly BUDGET_PUBLISHER=billing-budget-alert@system.gserviceaccount.com
 readonly SPEND_CAP_SOURCE="$REPO_ROOT/function"
+# The monthly reset runs outside $PROJECT: nothing in a project without billing
+# runs, a scheduler included.
+readonly RESET_FUNCTION="mcp-servers-cap-reset"
+readonly RESET_JOB="mcp-servers-cap-reset"
+readonly RESET_SA_ID="cap-resetter"
+readonly RESET_BUILD_SA_ID="cap-reset-build"
+readonly RESET_SOURCE="$REPO_ROOT/reset"
+# 00:30 daily in the budget's own time zone; it only acts in a month after the trip.
+readonly RESET_SCHEDULE="30 0 * * *"
+readonly RESET_TIMEZONE="America/Los_Angeles"
 
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
@@ -88,6 +104,13 @@ show() {
   gp run services describe "$FUNCTION" --region="$REGION" \
     --format='value(spec.template.spec.containers[0].env)' 2>/dev/null \
     | tr ';' '\n' | grep -o "'name': '[^']*', 'value': '[^']*'" || warn "$FUNCTION not deployed"
+  step "Monthly reset"
+  gcloud --quiet --project="$RESET_PROJECT" scheduler jobs describe "$RESET_JOB" \
+    --location="$REGION" --format='value(schedule,timeZone,state,lastAttemptTime,status.code)' \
+    2>/dev/null | awk -F'\t' '{ # status.code is a google.rpc code: absent once a run succeeds
+      last = ($4 == "" ? "never" : $4 ($5 == "" ? ", succeeded" : ", failed with code " $5))
+      printf "    %s (%s), %s; last run: %s\n", $1, $2, $3, last }' \
+    || warn "no monthly reset in $RESET_PROJECT"
 }
 
 # -- preflight ---------------------------------------------------------------
@@ -98,6 +121,8 @@ gcloud auth print-access-token >/dev/null 2>&1 \
 [[ -d $SPEND_CAP_SOURCE ]] || die "no function source at $SPEND_CAP_SOURCE"
 [[ $BUDGET_USD =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] || die "SHARED_CAP_USD must be an amount like 5"
 [[ $SPEND_CAP_AT =~ ^(0?\.[0-9]+|1(\.0+)?)$ ]] || die "SPEND_CAP_AT must be a fraction like 1.0"
+[[ $AUTO_RESET =~ ^(true|false)$ ]] || die "SHARED_CAP_AUTO_RESET must be true or false"
+[[ $AUTO_RESET == false || -d $RESET_SOURCE ]] || die "no reset source at $RESET_SOURCE"
 
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')" \
   || die "cannot read project $PROJECT"
@@ -210,6 +235,77 @@ gcloud billing budgets create \
   --quiet >/dev/null
 info "\"$BUDGET_NAME\": \$$BUDGET_USD a month over all of $PROJECT"
 info "email alerts to the billing admins at 50%, 90%, 100%"
+
+# -- monthly reset -----------------------------------------------------------
+
+if [[ $AUTO_RESET == true ]]; then
+  rp() { gcloud --quiet --project="$RESET_PROJECT" "$@"; }
+
+  step "Monthly reset in $RESET_PROJECT"
+  if ! gcloud projects describe "$RESET_PROJECT" >/dev/null 2>&1; then
+    gcloud projects create "$RESET_PROJECT" --name="MCP servers cap reset" >/dev/null \
+      || die "cannot create $RESET_PROJECT; set SHARED_CAP_RESET_PROJECT to an unused ID"
+    info "created $RESET_PROJECT"
+  else
+    info "$RESET_PROJECT already exists"
+  fi
+  # Deliberately outside the budget's filter: it has to keep running once the
+  # cap has cut $PROJECT off. One scheduler job and a daily call are free tier.
+  gcloud billing projects link "$RESET_PROJECT" --billing-account="$BILLING" >/dev/null
+  info "billed to $BILLING, outside the cap"
+  rp services enable cloudscheduler.googleapis.com cloudfunctions.googleapis.com \
+    run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com \
+    logging.googleapis.com cloudbilling.googleapis.com >/dev/null
+  info "APIs enabled"
+
+  ensure_reset_sa() { # $1 id, $2 display name
+    local email="$1@$RESET_PROJECT.iam.gserviceaccount.com"
+    if ! rp iam service-accounts describe "$email" >/dev/null 2>&1; then
+      rp iam service-accounts create "$1" --display-name="$2" >/dev/null
+      retry rp iam service-accounts describe "$email" >/dev/null 2>&1
+    fi
+    printf '%s' "$email"
+  }
+  RESET_SA="$(ensure_reset_sa "$RESET_SA_ID" "Shared MCP spend cap reset")"
+  RESET_BUILD_SA="$(ensure_reset_sa "$RESET_BUILD_SA_ID" "Shared MCP spend cap reset builds")"
+
+  # Linking takes a permission on both ends: attaching projects to this one
+  # billing account, and changing the billing of this one project. Logs Viewer
+  # reads the audit entry that says who unlinked it, and lets it read the
+  # project's billing info.
+  retry gcloud billing accounts add-iam-policy-binding "$BILLING" \
+    --member="serviceAccount:$RESET_SA" --role=roles/billing.user >/dev/null
+  for role in roles/billing.projectManager roles/logging.viewer; do
+    retry gp projects add-iam-policy-binding "$PROJECT" \
+      --member="serviceAccount:$RESET_SA" --role="$role" --condition=None >/dev/null
+  done
+  retry rp projects add-iam-policy-binding "$RESET_PROJECT" \
+    --member="serviceAccount:$RESET_BUILD_SA" --role=roles/cloudbuild.builds.builder \
+    --condition=None >/dev/null
+  info "$RESET_SA_ID may link $PROJECT to $BILLING, and nothing else"
+
+  info "deploying $RESET_FUNCTION (a few minutes)"
+  retry rp functions deploy "$RESET_FUNCTION" --gen2 --region="$REGION" --runtime=python312 \
+    --source="$RESET_SOURCE" --entry-point=relink_billing --trigger-http \
+    --run-service-account="$RESET_SA" \
+    --build-service-account="projects/$RESET_PROJECT/serviceAccounts/$RESET_BUILD_SA" \
+    --set-env-vars="RESET_PROJECT=$PROJECT,RESET_BILLING_ACCOUNT=$BILLING,RESET_CAP_SA=$SPEND_SA,RESET_DRY_RUN=$SPEND_CAP_DRY_RUN" \
+    --max-instances=1 --memory=256Mi --timeout=60s --no-allow-unauthenticated >/dev/null
+  retry rp run services add-iam-policy-binding "$RESET_FUNCTION" --region="$REGION" \
+    --member="serviceAccount:$RESET_SA" --role=roles/run.invoker >/dev/null
+  RESET_URL="$(rp functions describe "$RESET_FUNCTION" --gen2 --region="$REGION" \
+    --format='value(serviceConfig.uri)')"
+
+  job_verb=create
+  rp scheduler jobs describe "$RESET_JOB" --location="$REGION" >/dev/null 2>&1 && job_verb=update
+  retry rp scheduler jobs "$job_verb" http "$RESET_JOB" --location="$REGION" \
+    --schedule="$RESET_SCHEDULE" --time-zone="$RESET_TIMEZONE" \
+    --uri="$RESET_URL" --http-method=POST \
+    --oidc-service-account-email="$RESET_SA" --oidc-token-audience="$RESET_URL" >/dev/null
+  info "checks daily at 00:30 Pacific; links billing again in the month after a trip"
+else
+  note "SHARED_CAP_AUTO_RESET=false: after a trip, billing stays off until linked by hand"
+fi
 
 step "Done"
 info "every server in $PROJECT now shares one cap"

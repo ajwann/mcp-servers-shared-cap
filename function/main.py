@@ -13,7 +13,10 @@ This file needs no changes per project: it is configured entirely by the three
 SPEND_CAP_* environment variables the deploy script sets.
 
 Cost data trails actual usage by hours, so the trigger can be set to a fraction
-of the budget (SPEND_CAP_AT) rather than all of it.
+of the budget (SPEND_CAP_AT) rather than all of it. For the same reason a
+notification about a month that has already closed can arrive after the 1st,
+when ../reset has linked billing again; those are ignored, because cutting
+billing then saves nothing and would undo the monthly reset.
 
 Environment:
     SPEND_CAP_PROJECT   Project whose billing is cut. Required.
@@ -27,7 +30,9 @@ import base64
 import json
 import logging
 import os
+from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import functions_framework
 import google.auth
@@ -44,6 +49,9 @@ _logger.setLevel(logging.INFO)
 PROJECT_ID = os.environ["SPEND_CAP_PROJECT"]
 THRESHOLD = float(os.environ.get("SPEND_CAP_AT", "0.8"))
 DRY_RUN = os.environ.get("SPEND_CAP_DRY_RUN", "").strip().lower() in {"1", "true", "yes"}
+
+#: Budgets count calendar months in Pacific time, whatever the account's locale.
+BUDGET_TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 #: The one permission removing a project's billing account needs. The deploy
 #: script grants it through Project Billing Manager on this project alone, not
@@ -75,12 +83,37 @@ def over_threshold(notification: dict[str, Any], threshold: float = THRESHOLD) -
     return budget > 0 and cost >= threshold * budget
 
 
+def month_start(now: datetime) -> datetime:
+    """The start of the budget month containing ``now``."""
+    return now.astimezone(BUDGET_TIMEZONE).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def for_closed_month(notification: dict[str, Any], now: datetime) -> bool:
+    """Whether a budget notification reports on a month that has already ended.
+
+    A notification without ``costIntervalStart`` is treated as current, so a
+    malformed one errs towards cutting billing rather than ignoring spend.
+    """
+    interval_start = notification.get("costIntervalStart")
+    if not interval_start:
+        return False
+    return datetime.fromisoformat(interval_start) < month_start(now)
+
+
 @functions_framework.cloud_event
 def stop_billing(event: CloudEvent) -> None:
     """Handle one budget notification delivered through Pub/Sub."""
     notification = json.loads(base64.b64decode(event.data["message"]["data"]))
     cost = notification.get("costAmount")
     budget = notification.get("budgetAmount")
+    if for_closed_month(notification, datetime.now(UTC)):
+        _logger.info(
+            "ignoring spend %s of a %s budget for the month starting %s, which has ended",
+            cost,
+            budget,
+            notification["costIntervalStart"],
+        )
+        return
     if not over_threshold(notification):
         _logger.info(
             "spend %s of a %s budget is under the %.0f%% cap", cost, budget, THRESHOLD * 100
